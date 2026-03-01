@@ -6,6 +6,7 @@ rockchipmpp_sources = [
   'gstmppvideodec.c',
   'gstmppenc.c',
   'gstmppjpegenc.c',
+  'gstmppfpsdrop.c',
   'gstmpph264enc.c',
   'gstmpph265enc.c',
   'gstmppvp8enc.c',
