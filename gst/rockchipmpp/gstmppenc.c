@@ -124,6 +124,12 @@ static const MppFrameFormat gst_mpp_enc_formats[] = {
 };
 
 static gboolean
+gst_mpp_enc_use_async (GstMppEnc * self)
+{
+  return self->mpp_type != MPP_VIDEO_CodingMJPEG;
+}
+
+static gboolean
 gst_mpp_enc_format_supported (MppFrameFormat format)
 {
   guint i;
@@ -448,6 +454,44 @@ gst_mpp_enc_stop_task (GstVideoEncoder * encoder, gboolean drain)
 }
 
 static void
+gst_mpp_enc_clear_pending_frames (GstVideoEncoder * encoder)
+{
+  GstMppEnc *self = GST_MPP_ENC (encoder);
+  GList *frames, *l;
+
+  frames = gst_video_encoder_get_frames (encoder);
+  for (l = frames; l != NULL; l = l->next) {
+    GstVideoCodecFrame *frame = l->data;
+
+    /*
+     * Pending frames keep the converted input buffer in output_buffer.
+     * Drop that ref explicitly before tearing MPP down, otherwise the
+     * allocator group can still own a raw frame when the encoder stops.
+     */
+    gst_buffer_replace (&frame->output_buffer, NULL);
+  }
+  g_list_free_full (frames, (GDestroyNotify) gst_video_codec_frame_unref);
+
+  if (self->frames) {
+    g_list_free (self->frames);
+    self->frames = NULL;
+  }
+}
+
+static void
+gst_mpp_enc_clear_allocator (GstVideoEncoder * encoder)
+{
+  GstMppEnc *self = GST_MPP_ENC (encoder);
+
+  if (!self->allocator)
+    return;
+
+  gst_mpp_allocator_set_cacheable (self->allocator, FALSE);
+  gst_object_unref (self->allocator);
+  self->allocator = NULL;
+}
+
+static void
 gst_mpp_enc_reset (GstVideoEncoder * encoder, gboolean drain, gboolean final)
 {
   GstMppEnc *self = GST_MPP_ENC (encoder);
@@ -459,8 +503,14 @@ gst_mpp_enc_reset (GstVideoEncoder * encoder, gboolean drain, gboolean final)
   self->flushing = TRUE;
   self->draining = drain;
 
-  /* HACK: The MPP is not capable of handling resets properly. */
-  self->draining = TRUE;
+  /*
+   * The async reset workaround is still needed for inter-frame codecs, but
+   * it keeps one JPEG packet buffer alive when the stream is torn down after
+   * a healthy run. MJPEG has no inter-frame dependency, so let it use the
+   * caller requested drain policy and drop outstanding async work eagerly.
+   */
+  if (gst_mpp_enc_use_async (self))
+    self->draining = TRUE;
 
   gst_mpp_enc_stop_task (encoder, self->draining);
 
@@ -468,13 +518,9 @@ gst_mpp_enc_reset (GstVideoEncoder * encoder, gboolean drain, gboolean final)
   self->draining = FALSE;
 
   self->mpi->reset (self->mpp_ctx);
+  gst_mpp_enc_clear_pending_frames (encoder);
   self->task_ret = GST_FLOW_OK;
   self->pending_frames = 0;
-
-  if (self->frames) {
-    g_list_free (self->frames);
-    self->frames = NULL;
-  }
 
   /* Force re-apply prop */
   self->prop_dirty = TRUE;
@@ -501,14 +547,16 @@ gst_mpp_enc_start (GstVideoEncoder * encoder)
   if (mpp_create (&self->mpp_ctx, &self->mpi))
     goto err_unref_alloc;
 
-  timeout = MPP_POLL_NON_BLOCK;
-  if (self->mpi->control (self->mpp_ctx, MPP_SET_INPUT_TIMEOUT, &timeout))
-    goto err_destroy_mpp;
+  if (gst_mpp_enc_use_async (self)) {
+    timeout = MPP_POLL_NON_BLOCK;
+    if (self->mpi->control (self->mpp_ctx, MPP_SET_INPUT_TIMEOUT, &timeout))
+      goto err_destroy_mpp;
 
-  /* 1ms timeout for polling */
-  timeout = 1;
-  if (self->mpi->control (self->mpp_ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout))
-    goto err_destroy_mpp;
+    /* 1ms timeout for polling */
+    timeout = 1;
+    if (self->mpi->control (self->mpp_ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout))
+      goto err_destroy_mpp;
+  }
 
   if (mpp_init (self->mpp_ctx, MPP_CTX_ENC, self->mpp_type))
     goto err_destroy_mpp;
@@ -544,7 +592,7 @@ err_deinit_frame:
 err_destroy_mpp:
   mpp_destroy (self->mpp_ctx);
 err_unref_alloc:
-  gst_object_unref (self->allocator);
+  gst_mpp_enc_clear_allocator (encoder);
   return FALSE;
 }
 
@@ -567,9 +615,8 @@ gst_mpp_enc_stop (GstVideoEncoder * encoder)
   mpp_enc_cfg_deinit (self->mpp_cfg);
   mpp_frame_set_buffer (self->mpp_frame, NULL);
   mpp_frame_deinit (&self->mpp_frame);
+  gst_mpp_enc_clear_allocator (encoder);
   mpp_destroy (self->mpp_ctx);
-
-  gst_object_unref (self->allocator);
 
   if (self->input_state)
     gst_video_codec_state_unref (self->input_state);
@@ -924,6 +971,101 @@ err:
 }
 
 static gboolean
+gst_mpp_enc_process_frame_sync_locked (GstVideoEncoder * encoder)
+{
+  GstMppEnc *self = GST_MPP_ENC (encoder);
+  GstVideoCodecFrame *frame;
+  GstBuffer *buffer;
+  GstMemory *mem;
+  MppFrame input_frame = self->mpp_frame;
+  MppFrame meta_frame = NULL;
+  MppPacket mpkt = NULL;
+  MppMeta meta;
+  MppBuffer mbuf;
+  gint pkt_size;
+
+  if (!self->pending_frames)
+    return FALSE;
+
+  frame = gst_video_encoder_get_oldest_frame (encoder);
+  if (!frame)
+    return FALSE;
+
+  self->pending_frames--;
+  GST_MPP_ENC_BROADCAST (encoder);
+
+  mem = gst_buffer_peek_memory (frame->output_buffer, 0);
+  mbuf = gst_mpp_mpp_buffer_from_gst_memory (mem);
+  mpp_frame_set_buffer (input_frame, mbuf);
+
+  GST_VIDEO_ENCODER_STREAM_UNLOCK (encoder);
+  if (!self->mpi->encode_put_frame (self->mpp_ctx, input_frame))
+    self->mpi->encode_get_packet (self->mpp_ctx, &mpkt);
+  GST_VIDEO_ENCODER_STREAM_LOCK (encoder);
+
+  mpp_frame_set_buffer (input_frame, NULL);
+
+  if (!mpkt)
+    goto error;
+
+  meta = mpp_packet_get_meta (mpkt);
+  if (meta && !mpp_meta_get_frame (meta, KEY_INPUT_FRAME, &meta_frame))
+    mpp_frame_deinit (&meta_frame);
+
+  pkt_size = mpp_packet_get_length (mpkt);
+  mbuf = mpp_packet_get_buffer (mpkt);
+  if (!mbuf)
+    goto error;
+
+  if (self->zero_copy_pkt) {
+    buffer = gst_buffer_new ();
+    if (!buffer)
+      goto error;
+
+    mpp_buffer_set_index (mbuf, gst_mpp_allocator_get_index (self->allocator));
+
+    mem = gst_mpp_allocator_import_mppbuf (self->allocator, mbuf);
+    if (!mem) {
+      gst_buffer_unref (buffer);
+      goto error;
+    }
+
+    gst_memory_resize (mem, 0, pkt_size);
+    gst_buffer_append_memory (buffer, mem);
+  } else {
+    buffer = gst_video_encoder_allocate_output_buffer (encoder, pkt_size);
+    if (!buffer)
+      goto error;
+
+    gst_buffer_fill (buffer, 0, mpp_buffer_get_ptr (mbuf), pkt_size);
+  }
+
+  gst_buffer_replace (&frame->output_buffer, buffer);
+  gst_buffer_unref (buffer);
+
+  if (self->flushing && !self->draining)
+    goto drop;
+
+  GST_DEBUG_OBJECT (self, "finish frame ts=%" GST_TIME_FORMAT,
+      GST_TIME_ARGS (frame->pts));
+
+  self->task_ret = gst_video_encoder_finish_frame (encoder, frame);
+  goto out;
+
+error:
+  GST_WARNING_OBJECT (self, "can't process this frame");
+drop:
+  GST_DEBUG_OBJECT (self, "drop frame");
+  gst_buffer_replace (&frame->output_buffer, NULL);
+  self->task_ret = gst_video_encoder_finish_frame (encoder, frame);
+out:
+  if (mpkt)
+    mpp_packet_deinit (&mpkt);
+
+  return TRUE;
+}
+
+static gboolean
 gst_mpp_enc_send_frame_locked (GstVideoEncoder * encoder)
 {
   GstMppEnc *self = GST_MPP_ENC (encoder);
@@ -1070,11 +1212,15 @@ gst_mpp_enc_loop (GstVideoEncoder * encoder)
     goto out;
   }
 
-  /* Try sending ready frames to MPP (non-block) */
-  while (gst_mpp_enc_send_frame_locked (encoder));
+  if (gst_mpp_enc_use_async (self)) {
+    /* Try sending ready frames to MPP (non-block) */
+    while (gst_mpp_enc_send_frame_locked (encoder));
 
-  /* Try polling encoded packets from MPP (1ms timeout) */
-  while (gst_mpp_enc_poll_packet_locked (encoder));
+    /* Try polling encoded packets from MPP (1ms timeout) */
+    while (gst_mpp_enc_poll_packet_locked (encoder));
+  } else {
+    while (gst_mpp_enc_process_frame_sync_locked (encoder));
+  }
 
 out:
   if (self->task_ret != GST_FLOW_OK) {
@@ -1127,9 +1273,10 @@ gst_mpp_enc_handle_frame (GstVideoEncoder * encoder, GstVideoCodecFrame * frame)
     goto flushing;
 
   self->pending_frames++;
-  self->frames =
-      g_list_append (self->frames,
-      GUINT_TO_POINTER (frame->system_frame_number));
+  if (gst_mpp_enc_use_async (self))
+    self->frames =
+        g_list_append (self->frames,
+        GUINT_TO_POINTER (frame->system_frame_number));
 
   GST_MPP_ENC_BROADCAST (encoder);
 
